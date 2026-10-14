@@ -202,7 +202,7 @@ TIMEFRAME_MAP = {
     "1mo": {"period":"5y",   "interval":"1mo"},
 }
 
-DEFAULT_SYMBOLS = ["QQQ", "TSLA", "TSLL", "SPCX", "AAPL", "GOOGL", "XPEV", "NIO", "META", "MSFT", "NVDA", "AMD", "INTC", "TSM", "XOM" , "VST", "RKLB", "ARM", "SNDK","MU","NKE","AVGO"]
+DEFAULT_SYMBOLS = ["TSLA","AAPL","AMZN","NVDA","MSFT"]
 
 # ── v2.7：大時框「形成中 bar」偵測 ──────────────────────────────
 # 日內時框（1m–1h）在 analyze_cascade() 已用 hist_c/hist_c_prev（永遠丟最後一根未收盤
@@ -1537,6 +1537,56 @@ def build_macd_table(df, n=10):
         })
     return pd.DataFrame(rows), macd, signal, hist
 
+def market_state(now_ny=None):
+    """美股目前狀態（以美東時間判斷）。"""
+    ny = now_ny or datetime.now(ZoneInfo("America/New_York"))
+    if ny.weekday() >= 5:
+        return "休市"
+    t = ny.time()
+    if t < dtime(9, 30):  return "盤前"
+    if t < dtime(16, 0):  return "盤中"
+    return "盤後"
+
+def live_quote(df_raw, df_closed, interval="1d", now_ny=None):
+    """
+    日/週/月線：被 drop_forming_bar 排除的「形成中」那根 → 即時報價（僅供顯示，不納入訊號）。
+    若最後一根本來就已收盤（沒被排除），回傳 None。
+    """
+    if df_raw is None or df_closed is None or len(df_closed) == 0 or len(df_raw) <= len(df_closed):
+        return None
+    r   = df_raw.iloc[-1]
+    ref = float(df_closed["Close"].iloc[-1])
+    px  = float(r["Close"])
+    macd, _, hist = calc_macd(df_raw["Close"])
+    return {
+        "date": df_raw.index[-1], "price": px, "open": float(r["Open"]),
+        "high": float(r["High"]), "low": float(r["Low"]), "volume": float(r["Volume"]),
+        "ref_close": ref, "ref_date": df_closed.index[-1],
+        "chg": px - ref, "pct": (px / ref - 1) * 100 if ref else 0.0,
+        "macd": float(macd.iloc[-1]), "hist": float(hist.iloc[-1]),
+        "state": market_state(now_ny),
+        "unit": {"1d": "今日", "1wk": "本週", "1mo": "本月"}.get(interval, "目前"),
+    }
+
+def live_row_html(lq):
+    """已收盤表格下方的『形成中』即時列（獨立小表，視覺上與已收盤資料區隔）。"""
+    if not lq:
+        return ""
+    cc = "cell-pos" if lq["chg"] >= 0 else "cell-neg"
+    hc = "cell-pos" if lq["hist"] >= 0 else "cell-neg"
+    mc = "cell-pos" if lq["macd"] >= 0 else "cell-neg"
+    return (
+        f'<div style="margin:6px 0 2px;font-size:12px;color:#8a6d1d">'
+        f'⏳ {lq["unit"]}{lq["state"]}・尚未收盤的預覽（不納入上表與任何訊號判定）</div>'
+        f'<table class="macd-table" style="opacity:0.92"><thead><tr>'
+        f'<th>形成中</th><th>即時價</th><th>較最新收盤</th><th>MACD(預覽)</th><th>Hist(預覽)</th>'
+        f'<th>高 / 低</th><th>累計量</th></tr></thead><tbody><tr style="background:#fff8e6">'
+        f'<td>{lq["date"]:%m/%d} ⏳</td><td><b>{lq["price"]:.2f}</b></td>'
+        f'<td class="{cc}">{lq["chg"]:+.2f}（{lq["pct"]:+.2f}%）</td>'
+        f'<td class="{mc}">{lq["macd"]:+.3f}</td><td class="{hc}">{lq["hist"]:+.3f}</td>'
+        f'<td>{lq["high"]:.2f} / {lq["low"]:.2f}</td><td>{lq["volume"]/1e6:.1f}M</td>'
+        f'</tr></tbody></table>')
+
 def render_table(df_t):
     cols = ["日線","收盤","MACD","Hist","狀態","下一交易日","D+1","D+2","D+3"]
     hdr  = "".join(f"<th>{c}</th>" for c in cols)
@@ -1730,6 +1780,10 @@ def build_analysis_prompt(rank_data, main_tf, trigger_tf,
             pp.append(f"觸發時框已收盤價 {r['close_c']:.2f}")
         if trig.get("close") is not None:
             pp.append(f"觸發時框即時價 {trig['close']:.2f}")
+        if r.get("live"):
+            lq = r["live"]
+            pp.append(f"主時框{lq['unit']}{lq['state']}即時價 {lq['price']:.2f}"
+                      f"（較最新收盤 {lq['chg']:+.2f}／{lq['pct']:+.2f}%，未收盤）")
         pp.append(f"主時框 ATR {r['atr']:.3f}（{r['atr_pct']:.2f}%）")
         if trig.get("atr"):
             pp.append(f"觸發時框 ATR {trig['atr']:.3f}")
@@ -1841,7 +1895,7 @@ def build_analysis_prompt(rank_data, main_tf, trigger_tf,
     L.append("")
     L.append("---")
     L.append("以上數據為程式化技術指標計算結果，非投資建議；"
-              "請結合你查得到的最新公開資訊進行判斷。最后將交易計劃表生成可以下載的JSON格式:啟用,代碼,方向(做多,做空),入場下限,入場上限,止損,止損上限(可空),目標1,目標2,目標3,R:R 風險回報比備註。")
+              "請結合你查得到的最新公開資訊進行判斷。")
     return "\n".join(L)
 
 
@@ -1915,7 +1969,7 @@ def build_trade_plan(direction, level, pts, trig, style):
     return L
 
 
-def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_price, atr_1d, plan_style="穩健", setup=None):
+def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_price, atr_1d, plan_style="穩健", setup=None, live=None):
     atype     = resonance.get("atype","")
     trig      = resonance.get("trigger") or {}
     direction = resonance.get("direction")
@@ -1936,6 +1990,9 @@ def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_pric
         header = f"📊 {symbol} 市場分析"
 
     lines = [header, "━"*32, "【大時框方向確認】"]
+    if live:
+        lines.insert(2, f"⏱ {live['state']}即時 {live['price']:.2f}（{live['chg']:+.2f}｜{live['pct']:+.2f}%）"
+                        f"— {live['unit']}K線未收盤，以下訊號只用已收盤數據")
     for r in cascade:
         if not r.get("valid") or r["tf"] not in confirm_tfs:
             continue
@@ -2714,8 +2771,9 @@ for symbol in symbols:
     st.markdown(f"## 🔷 {symbol}")
 
     with st.spinner(f"載入 {symbol}..."):
-        df_main = fetch_data(symbol, tf_cfg["period"], tf_cfg["interval"])
-        df_main = drop_forming_bar(df_main, tf_cfg["interval"])
+        df_raw  = fetch_data(symbol, tf_cfg["period"], tf_cfg["interval"])
+        df_main = drop_forming_bar(df_raw, tf_cfg["interval"])
+        live    = live_quote(df_raw, df_main, tf_cfg["interval"])
 
     if df_main.empty or len(df_main) < 30:
         st.warning(f"⚠️ {symbol} 數據不足，跳過")
@@ -2737,12 +2795,21 @@ for symbol in symbols:
     prev  = df_main["Close"].iloc[-2]
     chg   = close_val - prev
     pct   = chg / prev * 100
+    live_card_html = ""
+    if live:
+        _lc = "pos" if live["chg"] >= 0 else "neg"
+        live_card_html = (
+            f'<div class="sub" style="margin-top:6px;padding-top:5px;border-top:1px dashed #d9d3c7">'
+            f'⏱ {live["state"]}即時 <b>{live["price"]:.2f}</b> '
+            f'<span class="{_lc}">{live["chg"]:+.2f}（{live["pct"]:+.2f}%）</span><br>'
+            f'<span style="color:#999;font-size:11px">{live["date"]:%m/%d} 未收盤・不納入訊號</span></div>')
     with c1:
         dc,ds = ("pos","▲") if chg>=0 else ("neg","▼")
         st.markdown(f"""<div class="metric-card">
             <div class="label">收盤 ({main_tf})</div>
             <div class="value">{close_val:.2f}</div>
             <div class="sub {dc}">{ds} {chg:+.2f} ({pct:+.2f}%)</div>
+            {live_card_html}
         </div>""", unsafe_allow_html=True)
     with c2:
         hc = "pos" if hist_val>=0 else "neg"
@@ -2930,6 +2997,8 @@ for symbol in symbols:
     # ── MACD 表格 ────────────────────────────────────────────
     st.markdown("#### 📋 近 10 根 K 線 MACD 分析")
     st.markdown(render_table(df_t), unsafe_allow_html=True)
+    if live:
+        st.markdown(live_row_html(live), unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── MACD 圖表 ────────────────────────────────────────────
@@ -2961,7 +3030,7 @@ for symbol in symbols:
     if chain_tfs:
         tg_msg = build_tg_msg(symbol, cascade, resonance,
                                confirm_tfs, trigger_tf, close_val, atr_main,
-                               plan_style=plan_style, setup=setup_results.get(symbol))
+                               plan_style=plan_style, setup=setup_results.get(symbol), live=live)
         tg_msgs_all.append(tg_msg)
 
         # ── v2.4：蒐集排序比較數據（供排行榜與深度分析 Prompt 使用）──
@@ -2980,6 +3049,7 @@ for symbol in symbols:
             "close_c": trig_d.get("close_c"),
             "fib": trig_d.get("fib"),
             "setup": setup_results.get(symbol),
+            "live": live,
             "vwap": trig_d.get("vwap"), "vwap_kind": trig_d.get("vwap_kind"),
             "gap_pct": trig_d.get("gap_pct"),
             "trigger_tf": trigger_tf,
