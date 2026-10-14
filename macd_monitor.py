@@ -621,6 +621,7 @@ def calc_fib_setup(dfw, dfd, df4, reversal_atr=2.5, min_leg_atr=4.0):
                 "zone": (levels[0.618], levels[0.382]),
                 "golden": (levels[0.618], levels[0.5])})
     ret = (b - px) / rng; out["ret"] = ret
+    out["in_zone"] = (0.382 - 0.03) <= ret <= (0.786 + 0.03)      # 價格是否已進入回調區（含深回調區）
 
     # 回調低點（B 之後的日線低點 + 之後新增的 4H 低點）
     after = dfd["Low"].iloc[B["i"] + 1:]
@@ -797,6 +798,13 @@ def setup_weekly_text(wk):
         s += f"｜未通過：{bad}"
     return s
 
+def setup_weekly_brief(wk):
+    if not wk:
+        return "資料不足"
+    marks = " ".join(("✓" if ok else "✗") + t for ok, t in wk["checks"])
+    st_mk = {"HH_HL": "✓高低點抬高", "LH_LL": "✗高低點下移", "mixed": "－結構不明"}[wk["structure"]]
+    return f"{wk['label']}（{wk['score']}分：{marks} {st_mk}）"
+
 def setup_checks_text(checks):
     if not checks:
         return None
@@ -808,9 +816,10 @@ def setup_plan_text(plan):
         return None
     rr = lambda x: "—" if x is None else f"{x:.2f}"
     t3 = f"｜T3 {plan['t3']:.2f}" if plan.get("t3") else ""
+    low = "｜⚠️ R:R<2，風險報酬偏低" if (plan.get("rr1") is not None and plan["rr1"] < 2) else ""
     return (f"{plan['kind']}：進場 {plan['entry']:.2f}｜止損 {plan['stop']:.2f}｜"
             f"T1 {plan['t1']:.2f}｜T2 {plan['t2']:.2f}{t3}｜R:R {rr(plan.get('rr1'))} / {rr(plan.get('rr2'))}"
-            f"（目標來源：{plan.get('src', '—')}）")
+            f"（目標來源：{plan.get('src', '—')}）{low}")
 
 def setup_card_html(symbol, s):
     col = setup_color(s["prio"])
@@ -828,7 +837,8 @@ def setup_card_html(symbol, s):
                      f"｜日線 EMA20 {s['ema20_d']:.2f}／EMA50 {s['ema50_d']:.2f}")
     rows = setup_checks_text(s.get("checks"))
     if rows:
-        L.append(f"<b>③ 4H 確認</b>（{s.get('bar4_time', '')}｜{s.get('n_ok', 0)}/4）")
+        L.append(f"<b>③ 4H 確認</b>（{s.get('bar4_time', '')}｜{s.get('n_ok', 0)}/4）"
+                 + ("" if s.get("in_zone", True) else "　<span style='color:#999'>價格未到回調區，僅供參考</span>"))
         for mk, nm, tx in rows:
             c = "#2e7d4f" if mk == "✓" else "#c0392b"
             L.append(f"　　<span style='color:{c};font-weight:700'>{mk}</span> {nm}：{tx}")
@@ -859,14 +869,15 @@ def setup_tg_lines(s):
     L = ["\n【斐波那契買點】" + s["status"]]
     wk = s.get("weekly")
     if wk:
-        L.append(f"  週線 {wk['label']}（{wk['score']}分）")
+        L.append(f"  週線 {setup_weekly_brief(wk)}")
     if s.get("A"):
         zl, zh = s["zone"]
         L.append(f"  波段 A {s['A']['price']:.2f} → B {s['B']['price']:.2f}（{s['leg_atr']:.0f}×ATR）")
         L.append(f"  現價 {s['px']:.2f} 回撤 {s['ret']*100:.1f}%｜回調區 {zl:.2f}～{zh:.2f}")
     rows = setup_checks_text(s.get("checks"))
     if rows:
-        L.append(f"  4H 確認 {s.get('n_ok', 0)}/4：" + " ".join(f"{m}{n}" for m, n, _ in rows))
+        L.append(f"  4H 確認 {s.get('n_ok', 0)}/4：" + " ".join(f"{m}{n}" for m, n, _ in rows)
+                 + ("" if s.get("in_zone", True) else "（價格未到回調區，僅供參考）"))
     pt = setup_plan_text(s.get("plan"))
     if pt:
         L.append("  " + pt)
@@ -1061,8 +1072,9 @@ def fetch_data(symbol, period, interval):
 # ══════════════════════════════════════════════════════════════
 # 瀑布傳導分析
 # ══════════════════════════════════════════════════════════════
-def analyze_cascade(symbol, chain):
+def analyze_cascade(symbol, chain, now_ny=None):
     results = []
+    ny = now_ny or datetime.now(ZoneInfo("America/New_York"))
     for tf in chain:
         cfg = TIMEFRAME_MAP.get(tf)
         if not cfg:
@@ -1073,14 +1085,19 @@ def analyze_cascade(symbol, chain):
             results.append({"tf":tf, "valid":False})
             continue
         intraday = cfg["interval"] in INTRADAY_IVS
+        # v2.16：最後一根是否已收盤。日/週/月線在抓取時已排除形成中的 bar → 一定已收盤；
+        # 日內則依美東時間判斷（盤前/盤後/週末最後一根其實已收完）。
+        last_closed = True if not intraday else (
+            not intraday_bar_forming(df.index[-1], cfg["interval"], ny))
+        ci = -1 if last_closed else -2          # 「已收盤那根」的位置
         macd, sig, hist = calc_macd(df["Close"])
         sts  = classify_status(hist, macd, sig)
-        hv   = hist.iloc[-1]     # 最後一根（可能未收盤，僅顯示用）
+        hv   = hist.iloc[-1]     # 最後一根（未收盤時僅顯示用）
         mv   = macd.iloc[-1]
         sv   = sts[-1]
 
         # ── v2.2：訊號判定一律用「已收盤」bar，避免未收盤 bar 重繪 ──
-        hist_closed = hist.iloc[:-1] if len(hist) > 1 else hist
+        hist_closed = hist if (last_closed or len(hist) < 2) else hist.iloc[:-1]
         hc  = hist_closed.iloc[-1]
         hcp = hist_closed.iloc[-2] if len(hist_closed) > 1 else hc
         # D+1/D+2/D+3 由已收盤序列外推（= 對「當前形成中 bar」的預測，不重繪）
@@ -1096,35 +1113,38 @@ def analyze_cascade(symbol, chain):
 
         # ── 量能：RVOL（已收盤 bar）──
         rv_series = calc_rvol(df) if intraday else calc_rvol_simple(df)
-        rvol = rv_series.iloc[-2] if len(rv_series) > 1 else np.nan
+        rvol = rv_series.iloc[ci] if len(rv_series) > 1 else np.nan
 
         # ── VWAP（已收盤 bar 位置）──
         #    日內：當日錨定 VWAP｜日/週線：20 根滾動 VWAP
         vwap_val, below_vwap = None, None
         vwap_kind = "當日VWAP" if intraday else "20期滾動VWAP"
         vw = calc_vwap(df) if intraday else calc_rolling_vwap(df)
-        if len(vw) > 1 and pd.notna(vw.iloc[-2]):
-            vwap_val   = float(vw.iloc[-2])
-            below_vwap = bool(df["Close"].iloc[-2] < vwap_val)
+        if len(vw) > 1 and pd.notna(vw.iloc[ci]):
+            vwap_val   = float(vw.iloc[ci])
+            below_vwap = bool(df["Close"].iloc[ci] < vwap_val)
 
         # ── 缺口（日內：當日開盤跳空｜日/週線：該根開盤 vs 前一根收盤）──
-        gap_pct = None
+        gap_pct, gap_stale = None, False
         if intraday:
             days = df.index.normalize()
             uday = days.unique()
             if len(uday) >= 2:
                 prev_close = df["Close"][days == uday[-2]].iloc[-1]
                 gap_pct    = float(df["Open"][days == uday[-1]].iloc[0] / prev_close - 1)
+                # v2.16：缺口只在「它發生的那個交易日、盤中」才算新事件。
+                # 盤前/盤後/隔日看到的是已過去的缺口，只顯示、不計分。
+                gap_stale = not (uday[-1].date() == ny.date() and market_state(ny) == "盤中")
         elif len(df) >= 3:
-            prev_close = df["Close"].iloc[-3]
+            prev_close = df["Close"].iloc[-2]          # df 已全為已收盤：最後一根的開盤 vs 前一根收盤
             if prev_close:
-                gap_pct = float(df["Open"].iloc[-2] / prev_close - 1)
+                gap_pct = float(df["Open"].iloc[-1] / prev_close - 1)
 
-        bar_dn = bool(df["Close"].iloc[-2] < df["Open"].iloc[-2]) if len(df) > 1 else False
+        bar_dn = bool(df["Close"].iloc[ci] < df["Open"].iloc[ci]) if len(df) > 1 else False
 
         # ── 斐波那契：日內丟最後一根形成中 bar（與 hist_c 同一慣例）；
         #    日/週/月線的 df 在抓取時已經過 drop_forming_bar，本身就是已收盤的 ──
-        fib_df = df.iloc[:-1] if (intraday and len(df) > 1) else df
+        fib_df = df if (last_closed or len(df) < 2) else df.iloc[:-1]
         fib    = calc_fib_levels(fib_df)
 
         results.append({
@@ -1136,14 +1156,15 @@ def analyze_cascade(symbol, chain):
             "sigma":sigma, "accel_dn":accel_dn, "accel_up":accel_up,
             "rvol": float(rvol) if pd.notna(rvol) else None,
             "vwap":vwap_val, "below_vwap":below_vwap, "vwap_kind":vwap_kind,
-            "gap_pct":gap_pct, "bar_dn":bar_dn,
+            "gap_pct":gap_pct, "gap_stale":gap_stale, "bar_dn":bar_dn,
+            "last_closed": last_closed, "bar_time": df.index[ci],
             "last_bar_day": str(df.index[-1].date()),
             "trend":get_trend(mv,hv,sv),
             "atr":calc_atr(df),
             "close":df["Close"].iloc[-1],
             # v2.9：已收盤價──與 hist_c / vwap_val / below_vwap / rvol / bar_dn
             # 同一根 K 棒，VWAP 上下方判定與距離%務必用這個，不要混用形成中價格
-            "close_c": df["Close"].iloc[-2] if len(df) > 1 else df["Close"].iloc[-1],
+            "close_c": df["Close"].iloc[ci] if len(df) > 1 else df["Close"].iloc[-1],
             "fib": fib,
         })
     return results
@@ -1200,7 +1221,7 @@ def calc_resonance(cascade, confirm_tfs, trigger_tf):
         d1   = trig.get("d1", 0)
         rvol = trig.get("rvol")
         bvw  = trig.get("below_vwap")
-        gap  = trig.get("gap_pct")
+        gap  = None if trig.get("gap_stale") else trig.get("gap_pct")   # v2.16：隔日/盤前的舊缺口不計分
 
         # ── 空頭事件 ──────────────────────────────────────
         bear_evt = bull_evt = False
@@ -1211,7 +1232,7 @@ def calc_resonance(cascade, confirm_tfs, trigger_tf):
         if trig.get("accel_dn"):
             bear_pts += 2; bear_dt.append("空頭加速 >1.5σ +2"); bear_evt = True
         if gap is not None and gap <= -0.015:
-            bear_pts += 3; bear_dt.append(f"開盤缺口 {gap*100:+.1f}% +3"); bear_evt = True
+            bear_pts += 3; bear_dt.append(f"開盤缺口 {gap*100:+.2f}% +3"); bear_evt = True
         if bear_score:
             bear_pts += bear_score
             bear_dt.append(f"大時框同向 ×{bear_score} +{bear_score}")
@@ -1224,7 +1245,7 @@ def calc_resonance(cascade, confirm_tfs, trigger_tf):
         if trig.get("accel_up"):
             bull_pts += 2; bull_dt.append("多頭加速 >1.5σ +2"); bull_evt = True
         if gap is not None and gap >= 0.015:
-            bull_pts += 3; bull_dt.append(f"開盤缺口 {gap*100:+.1f}% +3"); bull_evt = True
+            bull_pts += 3; bull_dt.append(f"開盤缺口 {gap*100:+.2f}% +3"); bull_evt = True
         if confirm_score:
             bull_pts += confirm_score
             bull_dt.append(f"大時框同向 ×{confirm_score} +{confirm_score}")
@@ -1275,6 +1296,18 @@ def calc_resonance(cascade, confirm_tfs, trigger_tf):
             direction, pts, detail = max(cands, key=lambda c: c[1])
             alert = True
             level = "red" if pts >= ALERT_RED else "yellow"
+            # v2.16 品質閘門：紅色警報須「多數確認時框同向」或「放量（RVOL≥1.5）」其一。
+            # 逆大時框又沒量 → 多半只是趨勢內的回調/反彈，降為橙色觀察。
+            # （放量的逆勢崩跌仍是紅色，不影響 07-02 型行情。）
+            if level == "red" and confirm_max:
+                aligned = bear_score if direction == "bear" else confirm_score
+                rv_ok = rvol is not None and not np.isnan(rvol) and rvol >= 1.5
+                if aligned < confirm_max * 0.5 and not rv_ok:
+                    level  = "yellow"
+                    detail = list(detail) + [
+                        f"逆大時框（同向 {aligned}/{confirm_max}）且量能不足"
+                        + (f"（RVOL {rvol:.2f}×）" if rvol is not None and not np.isnan(rvol) else "")
+                        + " → 降為觀察"]
             if direction == "bear":
                 atype = (f"警報：空頭 {pts} 分，建議減倉/離場" if level == "red"
                          else f"觀察：空頭訊號累積 {pts} 分")
@@ -1536,6 +1569,24 @@ def build_macd_table(df, n=10):
             "_h":h, "_m":m, "_st":st,
         })
     return pd.DataFrame(rows), macd, signal, hist
+
+_IV_MIN = {"1m": 1, "2m": 2, "5m": 5, "15m": 15, "30m": 30, "60m": 60, "1h": 60, "90m": 90}
+
+def intraday_bar_forming(bar_ts, interval, now_ny=None):
+    """
+    日內最後一根 K 線現在是否「真的還在走」。
+    舊版一律把最後一根當形成中；盤前/盤後/週末時那根其實早已收完，
+    導致訊號多落後一根、「未收盤」標籤也是錯的。
+    美股 1h 在 15:30 開始的那根實際只有 30 分鐘 → 結束時間取 min(開始+週期, 16:00)。
+    """
+    mins = _IV_MIN.get(interval)
+    if mins is None:
+        return False
+    ny  = now_ny or datetime.now(ZoneInfo("America/New_York"))
+    bts = (bar_ts.tz_convert("America/New_York") if bar_ts.tzinfo
+           else bar_ts.tz_localize("America/New_York"))
+    end = min(bts + pd.Timedelta(minutes=mins), bts.normalize() + pd.Timedelta(hours=16))
+    return pd.Timestamp(ny) < end
 
 def market_state(now_ny=None):
     """美股目前狀態（以美東時間判斷）。"""
@@ -1899,6 +1950,67 @@ def build_analysis_prompt(rank_data, main_tf, trigger_tf,
     return "\n".join(L)
 
 
+def build_verdict(cascade, confirm_tfs, trigger_tf, resonance, setup=None, state=None):
+    """
+    v2.16 綜合判斷：把「大方向 / 觸發時框 / 買點掃描」放在一起給單一結論，
+    避免同一則訊息一邊叫你空、一邊叫你等著買（空單目標常落在回調買入區裡）。
+    規則式（非預測）：大方向＝確認時框中最大兩個的已收盤 Hist 正負。
+    """
+    valid = {r["tf"]: r for r in cascade if r.get("valid")}
+    trig  = valid.get(trigger_tf)
+    conf  = [valid[t] for t in confirm_tfs if t in valid]
+    if not trig or not conf:
+        return []
+    h  = lambda r: r.get("hist_c", r["hist"])
+    big   = conf[-2:]                                   # 傳導鏈由小到大 → 最後兩個為最大時框
+    names = "/".join(r["tf"] for r in big)
+    sg    = sum(1 if h(r) > 0 else -1 for r in big)
+    big_dir   = "bull" if sg == len(big) else ("bear" if sg == -len(big) else "mixed")
+    short_dir = "bull" if h(trig) > 0 else "bear"
+    alert_dir = resonance.get("direction") if resonance.get("alert") else None
+    hs   = " ".join(f"{r['tf']}{h(r):+.2f}" for r in big)
+
+    zone_txt = None
+    if setup and setup.get("zone"):
+        zl, zh = setup["zone"]; zone_txt = f"{zl:.2f}～{zh:.2f}"
+    s_prio = (setup or {}).get("prio", 11)
+
+    L = ["\n【綜合判斷】"]
+    bd = {"bull": "多頭", "bear": "空頭", "mixed": "分歧"}[big_dir]
+    L.append(f"  大方向  {names} 已收盤 Hist（{hs}）→ {bd}")
+    L.append(f"  短線    {trigger_tf} 已收盤 Hist {h(trig):+.3f} → {'偏多' if short_dir == 'bull' else '偏空'}"
+             + (f"｜警報：{'空頭' if alert_dir == 'bear' else '多頭'}{'（紅）' if resonance.get('level') == 'red' else '（橙）'}"
+                if alert_dir else "｜無警報"))
+
+    if big_dir == "mixed":
+        concl = "大時框方向分歧，沒有順勢優勢"
+        act   = "降低倉位、不追單；等大時框同向，或等 4H 在關鍵位出現轉強/轉弱確認"
+    elif big_dir == "bull" and short_dir == "bear":
+        concl = f"屬大趨勢內的回調，不是趨勢反轉（{names} 動能仍向上）"
+        if s_prio <= 2:
+            act = "回調區已到位且 4H 確認 → 依【斐波那契買點】計畫做多，不追空"
+        elif zone_txt:
+            act = f"不追空（逆大趨勢、止損太近）；等價格回到 {zone_txt} 並出現 4H 轉強再買"
+        else:
+            act = "不追空；持多倉以回調低點為防守，等轉強再加碼"
+        if alert_dir == "bear":
+            act += f"。空頭警報僅供 {trigger_tf} 級別短打參考"
+    elif big_dir == "bull" and short_dir == "bull":
+        concl = "大小時框同向偏多（順勢）"
+        act = ("順勢做多，依交易建議執行" if alert_dir == "bull" and resonance.get("level") == "red"
+               else "持有；不追高，等回調買點或突破確認")
+    elif big_dir == "bear" and short_dir == "bear":
+        concl = "大小時框同向偏空（順勢）"
+        act = "持多倉減倉/離場，不抄底；反彈至壓力位再評估"
+    else:   # 大空、短多
+        concl = f"屬下降趨勢內的反彈（{names} 動能仍向下）"
+        act = "不追多；反彈至壓力位附近減倉，等大時框轉強再談做多"
+    L.append(f"  結論    {concl}")
+    L.append(f"  動作    {act}")
+    if state and state != "盤中":
+        L.append(f"  ⚠️ 目前{state}：開盤後待 {trigger_tf} 第一根收盤再確認，隔夜跳空可能改變以上判斷")
+    return L
+
 def build_trade_plan(direction, level, pts, trig, style):
     """
     依警報方向/等級/風格產生交易建議。
@@ -1912,7 +2024,7 @@ def build_trade_plan(direction, level, pts, trig, style):
     a  = trig.get("atr", 0)
     if not px or not a or a <= 0:
         return []
-    L = [f"\n【交易建議｜{style}】"]
+    L = [f"\n【日內交易建議｜{style}（觸發時框 ATR）】"]
 
     if style == "激進":
         if direction == "bear":
@@ -1989,16 +2101,24 @@ def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_pric
     else:
         header = f"📊 {symbol} 市場分析"
 
-    lines = [header, "━"*32, "【大時框方向確認】"]
+    ny    = datetime.now(ZoneInfo("America/New_York"))
+    state = market_state(ny)
+    lines = [header, "━"*32, "\n【大時框方向確認】"]
+    extra = []
     if live:
-        lines.insert(2, f"⏱ {live['state']}即時 {live['price']:.2f}（{live['chg']:+.2f}｜{live['pct']:+.2f}%）"
-                        f"— {live['unit']}K線未收盤，以下訊號只用已收盤數據")
+        extra.append(f"⏱ {live['state']}即時 {live['price']:.2f}（{live['chg']:+.2f}｜{live['pct']:+.2f}%）"
+                     f"— {live['unit']}K線未收盤，以下訊號只用已收盤數據")
+    extra += build_verdict(cascade, confirm_tfs, trigger_tf, resonance, setup, state)
+    lines[2:2] = extra
+    n_al, n_cf = 0, 0
     for r in cascade:
         if not r.get("valid") or r["tf"] not in confirm_tfs:
             continue
-        aligned = (r["hist"] < 0) if direction == "bear" else (r["hist"] > 0)
+        hr = r.get("hist_c", r["hist"])          # v2.16：顯示與計分都用已收盤值（舊版顯示最新、計分用前一根）
+        aligned = (hr < 0) if direction == "bear" else (hr > 0)
+        n_cf += 1; n_al += 1 if aligned else 0
         icon = "✅" if aligned else "❌"
-        lines.append(f"  {r['tf']:>3s}  {icon}  Hist {fmt(r['hist'],3)}  D+1 {fmt(r['d1'],3)}")
+        lines.append(f"  {r['tf']:>3s}  {icon}  Hist {fmt(hr,3)}  D+1 {fmt(r['d1'],3)}")
 
     if trig and trig.get("valid"):
         h, d1 = trig["hist"], trig["d1"]
@@ -2006,10 +2126,15 @@ def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_pric
         if   hc < 0 and d1 > 0: warn = " ← 預計翻正 🚨"
         elif hc > 0 and d1 < 0: warn = " ← 預計翻負 ⚠️"
         else:                   warn = ""
+        bt  = trig.get("bar_time")
+        bt_txt = f"（{bt:%m-%d %H:%M} 棒）" if hasattr(bt, "strftime") else ""
         lines += [
             f"\n【觸發時框 {trigger_tf}】",
-            f"  已收盤 Hist {fmt(hc,3)}  ← 訊號判定用",
-            f"  形成中 Hist {fmt(h,3)}（未收盤，僅預覽）",
+            f"  已收盤 Hist {fmt(hc,3)}{bt_txt}  ← 訊號判定用",
+        ]
+        if not trig.get("last_closed", False):      # 最後一根真的還在走才顯示
+            lines.append(f"  形成中 Hist {fmt(h,3)}（未收盤，僅預覽）")
+        lines += [
             f"  D+1        {fmt(d1,3)}{warn}",
             f"  D+2        {fmt(trig['d2'],3)}",
             f"  D+3        {fmt(trig['d3'],3)}",
@@ -2026,10 +2151,13 @@ def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_pric
             pos  = "下方" if trig.get("below_vwap") else "上方"
             dist = abs(trig.get("close_c", trig["close"])/vw - 1) * 100
             kind = trig.get("vwap_kind", "VWAP")
-            vparts.append(f"{kind}  {vw:.2f}（價格在{pos} {dist:.2f}%）")
+            if kind == "當日VWAP" and trig.get("last_bar_day") != ny.strftime("%Y-%m-%d"):
+                kind = "前一交易日VWAP"
+            cc = trig.get("close_c", trig["close"])
+            vparts.append(f"{kind}  {vw:.2f}（已收盤價 {cc:.2f} 在{pos} {dist:.2f}%）")
         gp = trig.get("gap_pct")
         if gp is not None and abs(gp) >= 0.003:
-            vparts.append(f"缺口  {gp*100:+.2f}%")
+            vparts.append(f"缺口  {gp*100:+.2f}%" + ("（非今日盤中，已過期，不計分）" if trig.get("gap_stale") else ""))
         if vparts:
             lines += ["\n【量能確認】"] + [f"  {p}" for p in vparts]
 
@@ -2056,9 +2184,13 @@ def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_pric
 
     # ── v2.3 交易建議 ─────────────────────────────────────
     if resonance["alert"]:
-        lines += build_trade_plan(direction, level, pts, trig, plan_style)
+        _plan = build_trade_plan(direction, level, pts, trig, plan_style)
+        if state != "盤中" and _plan:
+            _plan.insert(1, f"  ⚠️ 目前{state}：以下僅供開盤參考，不是即時進場指令；隔夜跳空可能使止損失效")
+        lines += _plan
 
-    lines += [f"\n【共振強度】 {resonance['score']}/{resonance['max']}"]
+    lines += [f"\n【共振強度】 {resonance['score']}/{resonance['max']}"
+              + (f"（確認時框同向 {n_al}/{n_cf}）" if n_cf else "")]
     if atype:
         lines.append(f"【信號類型】 {atype}")
 
@@ -2068,7 +2200,7 @@ def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_pric
             tg1  = close_price - 2.0 * atr_1d
             tg2  = close_price - 3.5 * atr_1d
             lines += [
-                f"\n【參考位置｜空頭】 收盤 {close_price:.2f}",
+                f"\n【波段參考位（主時框 ATR）｜空單】 收盤 {close_price:.2f}",
                 f"  止損  {stop:.2f}  (+1.5×ATR)",
                 f"  目標1 {tg1:.2f}  (-2.0×ATR)",
                 f"  目標2 {tg2:.2f}  (-3.5×ATR)",
@@ -2079,7 +2211,7 @@ def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_pric
             tg1  = close_price + 2.0 * atr_1d
             tg2  = close_price + 3.5 * atr_1d
             lines += [
-                f"\n【參考位置】 收盤 {close_price:.2f}",
+                f"\n【波段參考位（主時框 ATR）｜多單】 收盤 {close_price:.2f}",
                 f"  止損  {stop:.2f}  (-1.5×ATR)",
                 f"  目標1 {tg1:.2f}  (+2.0×ATR)",
                 f"  目標2 {tg2:.2f}  (+3.5×ATR)",
@@ -2090,10 +2222,8 @@ def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_pric
     lines += setup_tg_lines(setup)
 
     # ── v2.2：真正的美東時間 + 休市標註 ────────────────────
-    ny = datetime.now(ZoneInfo("America/New_York"))
-    stale = (trig.get("last_bar_day") and ny.strftime("%Y-%m-%d") != trig["last_bar_day"])
-    if ny.weekday() >= 5 or stale:
-        lines.insert(2, "⏸ 非交易時段／休市，以下為最近收盤數據")
+    if state != "盤中":
+        lines.insert(2, f"⏸ 目前{state}，以下為最近一個交易日的已收盤數據")
     lines.append(f"\n📅 {ny.strftime('%Y-%m-%d %H:%M')} ET")
     return "\n".join(lines)
 
