@@ -202,7 +202,7 @@ TIMEFRAME_MAP = {
     "1mo": {"period":"5y",   "interval":"1mo"},
 }
 
-DEFAULT_SYMBOLS = ["QQQ", "TSLA", "TSLL", "SPCX", "AAPL", "GOOGL", "XPEV", "NIO", "META", "MSFT", "NVDA", "AMD", "INTC", "TSM", "XOM" , "VST", "RKLB", "ARM", "SNDK","MU","NKE","AVGO"]
+DEFAULT_SYMBOLS = ["TSLA","AAPL","AMZN","NVDA","MSFT"]
 
 # ── v2.7：大時框「形成中 bar」偵測 ──────────────────────────────
 # 日內時框（1m–1h）在 analyze_cascade() 已用 hist_c/hist_c_prev（永遠丟最後一根未收盤
@@ -1738,6 +1738,8 @@ def build_analysis_prompt(rank_data, main_tf, trigger_tf,
     L.append("- 量能（依已收盤 K 線陰/陽記方向）：RVOL ≥2.5 +3｜1.5–2.5 +1｜<0.8 −2（縮量壓制訊號）")
     L.append("- VWAP 位置：價格在 VWAP 下方 → 空方 +1；上方 → 多方 +1")
     L.append("- 斐波那契：價格距 38.2/50/61.8/78.6% 任一回撤位 ≤0.5×ATR → 該位為支撐＝多方加分、為壓力＝空方加分；61.8% +2、其餘 +1")
+    L.append("- 缺口新鮮度：日內缺口只在「發生當日盤中」計分；盤前/盤後/隔日看到的舊缺口只顯示、不計分")
+    L.append("- 品質閘門：紅色警報須「多數確認時框同向」或「放量（RVOL≥1.5）」其一；逆大時框又沒量 → 降為橙色觀察")
     L.append(f"- 判定：必須先有至少一個「事件分」才能發警報（確認同向/量能/VWAP/斐波那契只能加成、不能單獨發起）；"
              f"≥{ALERT_RED} 分＝🔴 紅色警報、{ALERT_YELLOW}–{ALERT_RED-1} 分＝🟠 橙色觀察、<{ALERT_YELLOW} 分＝靜默；"
              "無正式警報時改用「潛在傾向分」（底層多/空分數）排序")
@@ -1841,6 +1843,11 @@ def build_analysis_prompt(rank_data, main_tf, trigger_tf,
         L.append("- 價格與波動：" + "｜".join(pp))
         L.append(f"- 多空潛在分：多 {r.get('bull_pts',0)}｜空 {r.get('bear_pts',0)}"
                  f"｜確認時框同向 {r['score']}/{r['max']}")
+
+        if r.get("verdict"):
+            L.append("- 綜合判斷（規則式，大方向／短線／動作）：")
+            for _v in r["verdict"][1:]:
+                L.append(f"  - {_v.strip()}")
 
         # 舊版既有段落（原樣保留）
         if r["atype"]:
@@ -1946,7 +1953,7 @@ def build_analysis_prompt(rank_data, main_tf, trigger_tf,
     L.append("")
     L.append("---")
     L.append("以上數據為程式化技術指標計算結果，非投資建議；"
-              "請結合你查得到的最新公開資訊進行判斷。限制：只能根據上面的數據推論，不得編造未提供的新聞或財報；數據不足時請明確說明。最后將交易計劃表生成可以下載的JSON格式:啟用,代碼,方向(做多,做空),入場下限,入場上限,止損,止損上限(可空),目標1,目標2,目標3,R:R 風險回報比備註。")
+              "請結合你查得到的最新公開資訊進行判斷。")
     return "\n".join(L)
 
 
@@ -2190,7 +2197,7 @@ def build_tg_msg(symbol, cascade, resonance, confirm_tfs, trigger_tf, close_pric
         lines += _plan
 
     lines += [f"\n【共振強度】 {resonance['score']}/{resonance['max']}"
-              + (f"（確認時框同向 {n_al}/{n_cf}）" if n_cf else "")]
+              + (f"（確認時框{ {'bear': '空頭', 'bull': '多頭'}.get(direction, '多頭') }同向 {n_al}/{n_cf}）" if n_cf else "")]
     if atype:
         lines.append(f"【信號類型】 {atype}")
 
@@ -3180,6 +3187,8 @@ for symbol in symbols:
             "fib": trig_d.get("fib"),
             "setup": setup_results.get(symbol),
             "live": live,
+            "verdict": build_verdict(cascade, confirm_tfs, trigger_tf, resonance,
+                                     setup_results.get(symbol), market_state()),
             "vwap": trig_d.get("vwap"), "vwap_kind": trig_d.get("vwap_kind"),
             "gap_pct": trig_d.get("gap_pct"),
             "trigger_tf": trigger_tf,
