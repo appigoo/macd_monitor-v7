@@ -202,7 +202,7 @@ TIMEFRAME_MAP = {
     "1mo": {"period":"5y",   "interval":"1mo"},
 }
 
-DEFAULT_SYMBOLS = ["QQQ", "TSLA", "TSLL", "SPCX", "AAPL", "GOOGL", "XPEV", "NIO", "META", "MSFT", "NVDA", "AMD", "INTC", "TSM", "XOM" , "VST", "RKLB", "ARM", "SNDK","MU","NKE","AVGO"]
+DEFAULT_SYMBOLS = ["TSLA","AAPL","AMZN","NVDA","MSFT"]
 
 # ── v2.7：大時框「形成中 bar」偵測 ──────────────────────────────
 # 日內時框（1m–1h）在 analyze_cascade() 已用 hist_c/hist_c_prev（永遠丟最後一根未收盤
@@ -346,20 +346,16 @@ def calc_fib_levels(df, lookback=60):
         "nearest_level": nearest_v, "dist_pct": dist_pct, "role": role,
     }
 
-def calc_sr_levels(df, window=5, tol_pct=0.006, max_each=3):
+def _pivot_clusters(df, window=5, tol_pct=0.006):
     """
-    支撐／壓力線（擺動高低點聚類）。
-    1) 左右各 window 根都不比它更高/更低的 K 線，記為擺動高點/低點（pivot）；
-       最後 window 根還無法確認，不納入（不會因新 K 線而重繪）。
-    2) 價差 ≤ tol_pct 的 pivot 合併為同一價位，觸及次數越多越強。
-    3) 現價下方取最強 max_each 個為「支撐」、上方取最強 max_each 個為「壓力」；
-       至少觸及 2 次才算可靠，若一個都沒有則退而取最近的單點，避免整張圖空白。
+    擺動高低點聚類（供圖上支撐壓力線與支撐/阻力面板共用）。
+    左右各 window 根都不比它更高/更低的 K 線記為 pivot；最後 window 根無法確認，不納入。
+    價差 ≤ tol_pct 的 pivot 合併為同一價位，touches＝觸及次數。
     """
     n = len(df)
     if n < window * 2 + 3:
         return []
     hi = df["High"].values; lo = df["Low"].values
-    px = float(df["Close"].iloc[-1])
     piv = []
     for i in range(window, n - window):
         if hi[i] >= hi[i-window:i+window+1].max(): piv.append((float(hi[i]), i))
@@ -373,8 +369,18 @@ def calc_sr_levels(df, window=5, tol_pct=0.006, max_each=3):
             clusters[-1][0].append(p); clusters[-1][1].append(i)
         else:
             clusters.append([[p], [i]])
-    lv = [{"price": sum(ps)/len(ps), "touches": len(ps), "last_i": max(ids)}
-          for ps, ids in clusters]
+    return [{"price": sum(ps)/len(ps), "touches": len(ps), "last_i": max(ids)}
+            for ps, ids in clusters]
+
+def calc_sr_levels(df, window=5, tol_pct=0.006, max_each=3):
+    """
+    圖上的支撐／壓力線：現價下方取最強 max_each 個為「支撐」、上方取最強 max_each 個為「壓力」；
+    至少觸及 2 次才算可靠，若一個都沒有則退而取最近的單點，避免整張圖空白。
+    """
+    lv = _pivot_clusters(df, window, tol_pct)
+    if not lv:
+        return []
+    px = float(df["Close"].iloc[-1])
 
     def pick(lst):
         strong = sorted([c for c in lst if c["touches"] >= 2],
@@ -386,6 +392,148 @@ def calc_sr_levels(df, window=5, tol_pct=0.006, max_each=3):
     out = [dict(c, kind="支撐") for c in pick([c for c in lv if c["price"] < px])]
     out += [dict(c, kind="壓力") for c in pick([c for c in lv if c["price"] > px])]
     return out
+
+# ══════════════════════════════════════════════════════════════
+# v2.18 支撐／阻力面板（量比、量價狀態、最近阻力/支撐、R1–R3/S1–S3 表、樞軸點）
+# ══════════════════════════════════════════════════════════════
+def calc_sr_table(df, atr, n_each=3, window=5, tol_pct=0.006):
+    """
+    面板用：現價上方由近到遠 R1–R3、下方由近到遠 S1–S3（觸及 1 次也列出，並標觸及次數）。
+    與圖上的線不同：圖上只畫較可靠（≥2 次）的；表格要看「最近的幾個價位」。
+    """
+    lv = _pivot_clusters(df, window, tol_pct)
+    px = float(df["Close"].iloc[-1])
+    res = sorted([c for c in lv if c["price"] > px], key=lambda c: c["price"])[:n_each]
+    sup = sorted([c for c in lv if c["price"] < px], key=lambda c: -c["price"])[:n_each]
+    mk = lambda c, tag, k: {"tag": f"{tag}{k}", "price": c["price"],
+                            "pct": (c["price"] / px - 1) * 100,
+                            "atr": (abs(c["price"] - px) / atr) if atr else None,
+                            "touches": c["touches"]}
+    return {"px": px, "R": [mk(c, "R", i + 1) for i, c in enumerate(res)],
+            "S": [mk(c, "S", i + 1) for i, c in enumerate(sup)]}
+
+def calc_pivots(df):
+    """經典樞軸點，以『最新那根的前一根 K 線』的 H/L/C 計算（與你原本面板標示一致）。"""
+    if len(df) < 2:
+        return None
+    p = df.iloc[-2]
+    H, L, C = float(p["High"]), float(p["Low"]), float(p["Close"])
+    P = (H + L + C) / 3
+    return {"P": P, "R1": 2*P - L, "S1": 2*P - H, "R2": P + (H - L), "S2": P - (H - L),
+            "H": H, "L": L, "C": C}
+
+def calc_obv(df):
+    return (np.sign(df["Close"].diff().fillna(0)) * df["Volume"]).cumsum()
+
+def obv_state(df, n=5):
+    """OBV 資金流向：近 n 根 OBV 淨變化與 OBV 相對 10 期 EMA 同向 → 流入／流出，否則持平。"""
+    if len(df) < n + 12:
+        return "資料不足"
+    obv = calc_obv(df); ema = obv.ewm(span=10, adjust=False).mean()
+    d = obv.iloc[-1] - obv.iloc[-1 - n]
+    if d > 0 and obv.iloc[-1] > ema.iloc[-1]: return "資金流入"
+    if d < 0 and obv.iloc[-1] < ema.iloc[-1]: return "資金流出"
+    return "資金持平"
+
+def vol_price_label(rvol, chg_pct):
+    """量價狀態：RVOL ≥2.5 爆量、≥1.5 放量、<0.8 縮量，其餘為量能正常；並標示當根漲跌。"""
+    if rvol is None or (isinstance(rvol, float) and np.isnan(rvol)):
+        return "量能資料不足"
+    tag = "爆量" if rvol >= 2.5 else ("放量" if rvol >= 1.5 else ("縮量" if rvol < 0.8 else None))
+    if tag is None:
+        return "量能正常"
+    return tag + ("上漲" if chg_pct > 0 else ("下跌" if chg_pct < 0 else ""))
+
+def range_position_label(px, R, S):
+    """目前位置：以面板列出的最遠阻力 R3 與最遠支撐 S3 為區間，三等分。"""
+    if not R or not S:
+        return "無明確區間"
+    lo, hi = S[-1]["price"], R[-1]["price"]
+    if hi <= lo:
+        return "無明確區間"
+    r = (px - lo) / (hi - lo)
+    return "區間下段" if r < 1/3 else ("區間中段" if r < 2/3 else "區間上段")
+
+def build_sr_panel(df_c, interval, atr):
+    """
+    支撐/阻力面板所需數據（只用已收盤 K 線 df_c）。
+    RVOL：日內用「過去 10 天同時段」基準，日線以上用前 20 根均量；均量＝量 ÷ RVOL。
+    """
+    if df_c is None or len(df_c) < 30 or not atr:
+        return None
+    intr = interval in INTRADAY_IVS
+    rv_s = calc_rvol(df_c) if intr else calc_rvol_simple(df_c)
+    rv   = rv_s.iloc[-1]
+    rvol = float(rv) if pd.notna(rv) else None
+    vol  = float(df_c["Volume"].iloc[-1])
+    chg  = float(df_c["Close"].iloc[-1] - df_c["Close"].iloc[-2])
+    pct  = chg / float(df_c["Close"].iloc[-2]) * 100
+    tbl  = calc_sr_table(df_c, atr)
+    return {
+        "rvol": rvol, "vol": vol, "avg_vol": (vol / rvol) if rvol else None,
+        "vp_state": vol_price_label(rvol, pct), "obv": obv_state(df_c),
+        "table": tbl, "pos": range_position_label(tbl["px"], tbl["R"], tbl["S"]),
+        "pivots": calc_pivots(df_c), "chg": chg, "pct": pct,
+    }
+
+def _lvl_card(title, lv, color):
+    if not lv:
+        return (f'<div class="metric-card"><div class="label">{title}</div>'
+                f'<div class="value" style="color:#999">—</div><div class="sub">範圍內無已確認價位</div></div>')
+    return (f'<div class="metric-card"><div class="label">{title}</div>'
+            f'<div class="value" style="color:{color}">{lv["price"]:.2f}</div>'
+            f'<div class="sub">{lv["pct"]:+.2f}% &nbsp;|&nbsp; {lv["atr"]:.1f} ATR &nbsp;|&nbsp; 觸及 {lv["touches"]} 次</div></div>')
+
+def sr_cards_html(d, ctx):
+    """8 張卡片（兩排各 4 張）。ctx＝主迴圈已算好的 close/chg/pct/macd/hist/d1/status/trend。"""
+    row1, row2 = [], []
+    dc, ds = ("pos", "▲") if ctx["chg"] >= 0 else ("neg", "▼")
+    row1.append(f'<div class="metric-card"><div class="label">最新收盤</div>'
+                f'<div class="value">{ctx["close"]:.2f}</div>'
+                f'<div class="sub {dc}">{ds} {ctx["chg"]:+.2f} ({ctx["pct"]:+.2f}%)</div></div>')
+    mc = "pos" if ctx["macd"] >= 0 else "neg"
+    row1.append(f'<div class="metric-card"><div class="label">MACD</div>'
+                f'<div class="value {mc}">{ctx["macd"]:+.3f}</div><div class="sub">{ctx["status"]}</div></div>')
+    hc = "pos" if ctx["hist"] >= 0 else "neg"
+    row1.append(f'<div class="metric-card"><div class="label">HISTOGRAM</div>'
+                f'<div class="value {hc}">{ctx["hist"]:+.3f}</div><div class="sub">D+1 {ctx["d1"]:+.3f}</div></div>')
+    row1.append(f'<div class="metric-card"><div class="label">整體趨勢</div>'
+                f'<div style="margin:8px 0 4px">{trend_pill(ctx["trend"])}</div></div>')
+    rv = d["rvol"]
+    rvs = f"{rv:.2f}x" if rv is not None else "—"
+    sub = (f'量 {d["vol"]/1e6:.2f}M / 均量 {d["avg_vol"]/1e6:.2f}M' if d["avg_vol"] else "—")
+    row2.append(f'<div class="metric-card"><div class="label">量比 RVOL</div>'
+                f'<div class="value" style="color:#777">{rvs}</div><div class="sub">{sub}</div></div>')
+    row2.append(f'<div class="metric-card"><div class="label">量價狀態</div>'
+                f'<div class="value" style="color:#777;font-size:22px">{d["vp_state"]}</div>'
+                f'<div class="sub">OBV {d["obv"]}</div></div>')
+    t = d["table"]
+    row2.append(_lvl_card("最近阻力", t["R"][0] if t["R"] else None, "#c0392b"))
+    row2.append(_lvl_card("最近支撐", t["S"][0] if t["S"] else None, "#3d8b5e"))
+    return row1, row2
+
+def sr_table_html(d):
+    t = d["table"]; px = t["px"]
+    hdr = "".join(f"<th>{c}</th>" for c in ["類型", "價位", "距現價", "距離（ATR）", "觸及次數"])
+    def row(l, cls, name):
+        a = f'{l["atr"]:.1f}' if l["atr"] is not None else "—"
+        return (f'<tr><td class="{cls}">{name} {l["tag"]}</td><td>{l["price"]:.2f}</td>'
+                f'<td class="{cls}">{l["pct"]:+.2f}%</td><td>{a}</td><td>{l["touches"]}</td></tr>')
+    body = "".join(row(l, "cell-neg", "阻力") for l in reversed(t["R"]))
+    body += (f'<tr style="background:#efebe4"><td><b>現價</b></td><td><b>{px:.2f}</b></td>'
+             f'<td>—</td><td>—</td><td>—</td></tr>')
+    body += "".join(row(l, "cell-pos", "支撐") for l in t["S"])
+    return f'<table class="macd-table"><thead><tr>{hdr}</tr></thead><tbody>{body}</tbody></table>'
+
+def pivots_html(pv):
+    if not pv:
+        return ""
+    chip = lambda k: (f'<span style="font-family:\'IBM Plex Mono\',monospace;background:#e8f1ea;color:#2e6b45;'
+                      f'padding:3px 9px;border-radius:5px;font-size:13px">{k} {pv[k]:.2f}</span>')
+    sep = ' <span style="color:#bbb">|</span> '
+    return ('<div style="margin:10px 0 2px"><b>樞軸點（前一根 K 線計算）：</b> '
+            + sep.join(chip(k) for k in ["R2", "R1", "P", "S1", "S2"]) + '</div>')
+
 
 # ══════════════════════════════════════════════════════════════
 # v2.14 斐波那契買點掃描：週線定方向 → 日線找位置 → 4H 確認入場
@@ -1880,6 +2028,28 @@ def build_analysis_prompt(rank_data, main_tf, trigger_tf,
         if vp:
             L.append("- 量能與位置：" + "｜".join(vp))
 
+        # 支撐／阻力面板（主時框）
+        _s = r.get("srp")
+        if _s:
+            _t = _s["table"]
+            L.append(f"- 支撐/阻力（主時框 {main_tf}，擺動點聚類；目前位置：{_s['pos']}）：")
+            L.append("")
+            L.append("| 類型 | 價位 | 距現價 | 距離(ATR) | 觸及次數 |")
+            L.append("|---|---|---|---|---|")
+            for _l in reversed(_t["R"]):
+                L.append(f"| 阻力 {_l['tag']} | {_l['price']:.2f} | {_l['pct']:+.2f}% | {_l['atr']:.1f} | {_l['touches']} |")
+            L.append(f"| 現價 | {_t['px']:.2f} | — | — | — |")
+            for _l in _t["S"]:
+                L.append(f"| 支撐 {_l['tag']} | {_l['price']:.2f} | {_l['pct']:+.2f}% | {_l['atr']:.1f} | {_l['touches']} |")
+            L.append("")
+            if _s.get("pivots"):
+                _pv = _s["pivots"]
+                L.append(f"- 樞軸點（前一根 K 線計算）：R2 {_pv['R2']:.2f}｜R1 {_pv['R1']:.2f}｜P {_pv['P']:.2f}｜"
+                         f"S1 {_pv['S1']:.2f}｜S2 {_pv['S2']:.2f}")
+            _rv = f"{_s['rvol']:.2f}×" if _s.get("rvol") is not None else "—"
+            _av = (f"（量 {_s['vol']/1e6:.2f}M／均量 {_s['avg_vol']/1e6:.2f}M）" if _s.get("avg_vol") else "")
+            L.append(f"- 主時框量價：RVOL {_rv}{_av}｜量價狀態 {_s['vp_state']}｜OBV {_s['obv']}")
+
         # 觸發時框明細
         if trig.get("valid"):
             L.append(f"- 觸發時框 {trigger_tf} Histogram：已收盤 {sg(trig.get('hist_c'))}"
@@ -2819,6 +2989,7 @@ with st.sidebar:
     show_sr   = st.checkbox("支撐／壓力線",        value=True, key="ov_sr")
     show_vwap = st.checkbox("主力成本線（VWAP）",  value=True, key="ov_vwap")
     show_vol  = st.checkbox("成交量副圖",          value=True, key="ov_vol")
+    show_srp  = st.checkbox("支撐/阻力面板（含樞軸點）", value=True, key="ov_srp")
 
     st.markdown("**🎯 斐波那契買點掃描**")
     zz_rev = st.slider("ZigZag 反轉門檻（×日線ATR）", 1.5, 4.0, 2.5, 0.5, key="zz_rev",
@@ -2978,6 +3149,27 @@ for symbol in symbols:
             <div style="margin:8px 0 4px">{trend_pill(trend)}</div>
             <div class="sub">ATR {atr_main:.3f}</div>
         </div>""", unsafe_allow_html=True)
+
+    # ── v2.18 支撐／阻力面板（量比、量價狀態、最近阻力/支撐、R1–R3/S1–S3、樞軸點）──
+    srp = None
+    if show_srp:
+        _iv = tf_cfg["interval"]
+        _closed_ok = (_iv not in INTRADAY_IVS) or (not intraday_bar_forming(df_main.index[-1], _iv))
+        _df_c = df_main if (_closed_ok or len(df_main) < 2) else df_main.iloc[:-1]
+        srp = build_sr_panel(_df_c, _iv, atr_main)
+        if srp:
+            _ctx = {"close": float(_df_c["Close"].iloc[-1]), "chg": srp["chg"], "pct": srp["pct"],
+                    "macd": macd_val, "hist": hist_val, "d1": d1, "status": status_v, "trend": trend}
+            _r1, _r2 = sr_cards_html(srp, _ctx)
+            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+            for _row in (_r1, _r2):
+                for _col, _h in zip(st.columns(4), _row):
+                    _col.markdown(_h, unsafe_allow_html=True)
+            st.markdown(
+                f"#### 🧱 支撐 / 阻力 <span style='font-size:13px;color:#888;font-weight:400;"
+                f"margin-left:12px'>目前位置：{srp['pos']}</span>", unsafe_allow_html=True)
+            st.markdown(sr_table_html(srp), unsafe_allow_html=True)
+            st.markdown(pivots_html(srp["pivots"]), unsafe_allow_html=True)
 
     # ── v2.10 斐波那契面板（主時框，已收盤 K 線）────────────────
     fib_main = calc_fib_levels(df_main.iloc[:-1] if (tf_cfg["interval"] in INTRADAY_IVS and len(df_main) > 1) else df_main)
@@ -3197,6 +3389,7 @@ for symbol in symbols:
             "fib": trig_d.get("fib"),
             "setup": setup_results.get(symbol),
             "live": live,
+            "srp": srp,
             "verdict": build_verdict(cascade, confirm_tfs, trigger_tf, resonance,
                                      setup_results.get(symbol), market_state()),
             "vwap": trig_d.get("vwap"), "vwap_kind": trig_d.get("vwap_kind"),
