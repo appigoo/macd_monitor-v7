@@ -202,7 +202,7 @@ TIMEFRAME_MAP = {
     "1mo": {"period":"5y",   "interval":"1mo"},
 }
 
-DEFAULT_SYMBOLS = ["TSLA","AAPL","AMZN","NVDA","MSFT"]
+DEFAULT_SYMBOLS = ["QQQ", "TSLA", "TSLL", "SPCX", "AAPL", "GOOGL", "XPEV", "NIO", "META", "MSFT", "NVDA", "AMD", "INTC", "TSM", "XOM" , "VST", "RKLB", "ARM", "SNDK","MU","NKE","AVGO"]
 
 # ── v2.7：大時框「形成中 bar」偵測 ──────────────────────────────
 # 日內時框（1m–1h）在 analyze_cascade() 已用 hist_c/hist_c_prev（永遠丟最後一根未收盤
@@ -237,10 +237,12 @@ STATUS_NEXT_DAY = {
     "空頭減弱":      ("跌速放慢",    "warn"),
     "跌勢放緩":      ("接近底部",    "warn"),
     "空頭衰退":      ("技術反彈",    "warn"),
-    "接近反轉":      ("金叉概率提升","neu"),
+    "接近金叉":      ("金叉概率提升","neu"),
+    "接近死叉":      ("死叉概率提升","warn"),
+    "接近反轉":      ("方向待確認",  "neu"),     # 舊狀態名，保留相容
     "多頭開始回補":  ("動能轉正",    "bull"),
-    "Histogram翻正": ("短線突破",    "bull"),
-    "Histogram翻負": ("跌勢展開",    "bear"),
+    "Histogram翻正": ("金叉已成，短線突破", "bull"),
+    "Histogram翻負": ("死叉已成，跌勢展開", "bear"),
     "MACD金叉確認":  ("多頭加速",    "bull"),
     "多頭加速":      ("趨勢延續",    "bull"),
     "強勢多頭":      ("趨勢延續",    "bull"),
@@ -983,9 +985,15 @@ def classify_status(hist, macd, signal):
         sp = signal.iloc[i-1] if i>0 else s
         sg = sig_roll.iloc[i]
         thr = max(0.005, 0.15 * sg) if pd.notna(sg) else 0.005
-        if   abs(h) < thr:                        st = "接近反轉"
-        elif i>0 and hp<0 and h>=0:               st = "Histogram翻正"
-        elif i>0 and hp>=0 and h<0:               st = "Histogram翻負"
+        # v2.17：已發生的交叉（金叉＝Hist 由負轉正，死叉＝由正轉負）優先判定，
+        # 不可被「數值很小」吞掉；「接近交叉」必須看 Hist 的走向：
+        #   Hist<0 且向上收斂 → 接近金叉；Hist>0 且向下收斂 → 接近死叉。
+        # 舊版 abs(h)<thr 一律標「接近反轉」並對應「金叉概率提升」，
+        # 剛剛死叉、Hist 還在往下掉時也會被標成金叉概率提升。
+        if   i>0 and hp<0 and h>=0:               st = "Histogram翻正"          # 金叉已成
+        elif i>0 and hp>=0 and h<0:               st = "Histogram翻負"          # 死叉已成
+        elif i>0 and abs(h) < thr and h<0 and h>hp:  st = "接近金叉"
+        elif i>0 and abs(h) < thr and h>0 and h<hp:  st = "接近死叉"
         elif i>0 and m>s and mp<=sp:              st = "MACD金叉確認"
         elif h>0 and m>0:                          st = "強勢多頭"
         elif h>0 and i>0 and h>hp:                st = "多頭加速"
@@ -1000,7 +1008,7 @@ def get_trend(macd_val, hist_val, status):
     if macd_val>0 and hist_val>0:   return "強勢多頭"
     elif hist_val>0:                 return "多頭趨勢"
     elif hist_val<0 and macd_val<0: return "空頭趨勢"
-    elif any(k in status for k in ["接近反轉","翻正","金叉"]): return "趨勢反轉中"
+    elif any(k in status for k in ["接近反轉","翻正","金叉","接近死叉"]): return "趨勢反轉中"
     else:                            return "震盪觀望"
 
 def trend_pill(tr):
@@ -1010,6 +1018,8 @@ def trend_pill(tr):
     return f'<span class="pill-{c}">{i} {tr}</span>'
 
 def badge_html(st):
+    if "接近" in st:
+        return f'<span class="badge badge-warn">◆ {st}</span>'
     if any(k in st for k in ["多頭","翻正","金叉","放緩"]):
         return f'<span class="badge badge-bull">▲ {st}</span>'
     elif any(k in st for k in ["空頭","動能強","翻負"]):
