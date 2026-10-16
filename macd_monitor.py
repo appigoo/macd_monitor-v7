@@ -202,7 +202,7 @@ TIMEFRAME_MAP = {
     "1mo": {"period":"5y",   "interval":"1mo"},
 }
 
-DEFAULT_SYMBOLS = ["TSLA","AAPL","AMZN","NVDA","MSFT"]
+DEFAULT_SYMBOLS = ["QQQ", "TSLA", "TSLL", "SPCX", "AAPL", "GOOGL", "XPEV", "NIO", "META", "MSFT", "NVDA", "AMD", "INTC", "TSM", "XOM" , "VST", "RKLB", "ARM", "SNDK","MU","NKE","AVGO"]
 
 # ── v2.7：大時框「形成中 bar」偵測 ──────────────────────────────
 # 日內時框（1m–1h）在 analyze_cascade() 已用 hist_c/hist_c_prev（永遠丟最後一根未收盤
